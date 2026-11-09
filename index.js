@@ -15,6 +15,8 @@ import { importGraphJson as importGraphJsonImpl, exportGraphJson as exportGraphJ
 const MODULE = '[EpistemicGraphRAG]';
 const EXTENSION_NAME = 'st-epistemic-graph-rag';
 const PROMPT_TAG = 'epistemic_graph_rag';
+const BUILD_PROMPT_TAG = 'epistemic_graph_rag_build';
+const ASSISTANT_GENERATION_TYPES = new Set(['normal', 'continue', 'regenerate', 'swipe']);
 
 console.log(MODULE, 'index.js 开始加载');
 
@@ -32,6 +34,14 @@ const defaultSettings = {
 const storage = new GraphStorage();
 const embedder = new EmbeddingService({ getRequestHeaders });
 export const graph = new LongTermEpistemicGraph(embedder);
+let activeGraphChatId = '';
+let generationEpoch = 0;
+let receiveQueue = Promise.resolve();
+
+function clearGenerationPrompts() {
+    setExtensionPrompt(PROMPT_TAG, '', extension_prompt_types.IN_CHAT, 1);
+    setExtensionPrompt(BUILD_PROMPT_TAG, '', extension_prompt_types.IN_CHAT, 1);
+}
 
 function log(...args) {
     if (getSettings().debugLog) console.log(MODULE, ...args);
@@ -176,27 +186,19 @@ function resolveActiveNpc() {
 
 /* ---------------------------- 拦截器 ------------------------------ */
 globalThis.epistemicGraphInterceptor = async function (chat, contextSize, abort, type) {
+    clearGenerationPrompts();
+    const epoch = ++generationEpoch;
     const settings = getSettings();
-    if (!settings.enabled || !Array.isArray(chat) || chat.length === 0) return;
+    if (!settings.enabled || !ASSISTANT_GENERATION_TYPES.has(type) || !Array.isArray(chat) || chat.length === 0) return;
+
+    const context = getContext();
+    const chatId = context?.chatId;
+    if (!chatId || activeGraphChatId !== chatId) return;
 
     const npc = resolveActiveNpc();
     if (!npc) return;
 
     const totalMessages = chat.length;
-    const recentWindow = Math.max(4, Number(settings.recentWindowSize) || 16);
-    const cutoff = Math.max(0, totalMessages - recentWindow);
-    if (cutoff > 0) chat.splice(0, cutoff);
-
-    if (settings.maskAbsentHistory) {
-        for (let i = 0; i < chat.length - 1; i++) {
-            const msgId = chat[i]?.mes_id ?? (cutoff + i);
-            const present = graph.messagePresence.get(msgId);
-            if (present && !present.has(npc)) {
-                chat[i] = { ...chat[i], mes: `[第${msgId}楼历史隔离：该事件发生时 ${npc} 不在场，无现场记忆]` };
-            }
-        }
-    }
-
     const queryText = chat.slice(-2).map(m => m?.mes || '').join('\n');
     const { activeFacts, historicalFacts } = await graph.retrieveContextForNpc({
         npcId: npc,
@@ -205,13 +207,34 @@ globalThis.epistemicGraphInterceptor = async function (chat, contextSize, abort,
         topK: Number(settings.topK) || 8
     });
 
+    // Retrieval is asynchronous; never apply a result after the user switched chats or speakers.
+    if (epoch !== generationEpoch || !getSettings().enabled || getContext()?.chatId !== chatId || resolveActiveNpc() !== npc || activeGraphChatId !== chatId) return;
+
+    if (type !== 'continue') {
+        const npcIdSlug = Array.from(npc, char => /[A-Za-z0-9_-]/.test(char) ? char : `u${char.codePointAt(0).toString(16)}`).join('_');
+        setExtensionPrompt(BUILD_PROMPT_TAG, `${GRAPH_RULES_TEXT}\n\nAdditional constraints:\n- Prefix every fact ID with this assistant turn's stable identifier: turn_${totalMessages}_${npcIdSlug}; add a per-turn sequence number. Reuse the same stable NPC name already present in this graph; do not create alternate names for the same person.\n- Grant each fact only to named characters who directly experienced it or learned it through an explicit in-story source. A card or world name is not itself evidence that everyone knows its contents.\n- Keep fact visibility scoped to each NPC's actual knowledge; do not grant world-level facts to all characters by default.`, extension_prompt_types.IN_CHAT, 1);
+    }
+
     if (!activeFacts.length && !historicalFacts.length) {
-        log(`拦截器：${npc} 无已知事实，跳过注入（图谱为空或该角色无边）`);
+        log(`拦截器：${npc} 无已知事实，仅注入本轮建图规则，不裁剪或遮蔽历史`);
         return;
     }
 
     const prompt = graph.buildEpistemicPrompt({ npcId: npc, activeFacts, historicalFacts });
     setExtensionPrompt(PROMPT_TAG, prompt, extension_prompt_types.IN_CHAT, 1);
+
+    const recentWindow = Math.max(4, Number(settings.recentWindowSize) || 16);
+    const cutoff = Math.max(0, totalMessages - recentWindow);
+    if (settings.maskAbsentHistory) {
+        for (let i = 0; i < chat.length - 1; i++) {
+            const msgId = chat[i]?.mes_id ?? i;
+            const present = graph.messagePresence.get(msgId);
+            if (present && !present.has(npc)) {
+                chat[i] = { ...chat[i], mes: `[第${msgId}楼历史隔离：该事件发生时 ${npc} 不在场，无现场记忆]` };
+            }
+        }
+    }
+    if (cutoff > 0) chat.splice(0, cutoff);
 
     if (settings.debugLog) {
         console.log(MODULE, `注入 | 角色=${npc} | 召回=${activeFacts.length} | 楼层=${totalMessages} | 裁剪=${cutoff}\n` + prompt);
@@ -225,16 +248,18 @@ async function syncCurrentChatGraph() {
     if (!chatId) { updateStatus('未打开聊天'); return; }
 
     const saved = await storage.loadGraph(chatId);
+    if (getContext()?.chatId !== chatId) return;
     if (saved) {
         graph.deserialize(saved);
         log('载入图谱', chatId, 'Facts=', graph.facts.size);
     } else {
-        graph.deserialize(null);
+        graph.deserialize({});
         if (getSettings().autoSeed) {
             await seedMvpWarehouseScenario(graph);
             await storage.saveGraph(chatId, graph.serialize());
         }
     }
+    activeGraphChatId = chatId;
     updateStatus();
 }
 
@@ -389,7 +414,7 @@ function bindPanel() {
     });
 
     $('#eg_clear').on('click', async () => {
-        graph.deserialize(null);
+        graph.deserialize({});
         await persistGraph();
         updateStatus();
         $('#eg_output').text('当前聊天的图谱已清空。');
@@ -462,16 +487,26 @@ jQuery(async () => {
         tryMount();
 
         eventSource.on(event_types.CHAT_CHANGED, async () => {
+            generationEpoch++;
+            activeGraphChatId = '';
+            clearGenerationPrompts();
+            await receiveQueue;
             await syncCurrentChatGraph();
         });
 
         eventSource.on(event_types.MESSAGE_RECEIVED, async (messageIndex) => {
             const ctx = getContext();
             const msg = ctx?.chat?.[messageIndex];
-            if (!msg?.mes) return;
-            const changed = await parseAndApplyGraphMarkup(msg.mes, messageIndex, graph);
-            if (changed) await persistGraph();
-            if (mounted) updateStatus();
+            const chatId = ctx?.chatId;
+            const graphChatId = activeGraphChatId;
+            const messageText = msg?.mes;
+            if (!messageText || !chatId || graphChatId !== chatId) return;
+            receiveQueue = receiveQueue.then(async () => {
+                const changed = await parseAndApplyGraphMarkup(messageText, messageIndex, graph);
+                if (changed) await storage.saveGraph(chatId, graph.serialize());
+                if (mounted && getContext()?.chatId === chatId) updateStatus();
+            }).catch(err => console.error(MODULE, '保存收到的图谱数据失败:', err));
+            await receiveQueue;
         });
 
         console.log(MODULE, '初始化完成');

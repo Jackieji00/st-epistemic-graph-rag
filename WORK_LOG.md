@@ -1,0 +1,5 @@
+# Work Log
+
+[2026-11-10 02:52 Asia/Shanghai] | `README.md`, `EXPLANATIONS.md` | Clarified SillyTavern regex filtering: Display Only hides graph metadata in chat, Prompt Only can additionally exclude it from later prompts, and storage-level message rewriting should be avoided.
+
+[2026-11-10 02:46 Asia/Shanghai] | `index.js`, `manifest.json`, `README.md`, `test/verify_generation_interceptor.mjs`, `EXPLANATIONS.md` | Fixed legacy generation flow: clear extension prompts per generation/chat switch, auto-inject independent build instructions on new assistant replies, preserve untrimmed history when no memory is available, guard stale async retrievals across chat/speaker changes, serialize received graph updates under their source chat ID before chat deserialization, clear unsaved destination graphs and make the UI clear action actually clear, add interceptor/receive-path and chat-switch race coverage, document v0.3.1 behavior and display-only metadata filtering. Continuations retain eligible memory but do not repeat build instructions.
