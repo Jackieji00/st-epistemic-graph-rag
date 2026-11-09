@@ -1,3 +1,14 @@
+.epistemic-graph-settings .eg-status {
+    margin-bottom: 10px;
+    padding: 6px 8px;
+    font-size: 12px;
+    line-height: 1.5;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.18);
+    word-break: break-all;
+}
+
 .epistemic-graph-settings .eg-row {
     margin-top: 8px;
     display: flex;
@@ -5,19 +16,26 @@
     gap: 4px;
 }
 
+.epistemic-graph-settings .eg-row label {
+    font-size: 12px;
+    opacity: 0.85;
+}
+
 .epistemic-graph-settings .eg-actions {
     margin-top: 10px;
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
 }
 
 .epistemic-graph-settings .eg-inspector {
     margin-top: 10px;
     padding: 8px;
-    max-height: 220px;
+    max-height: 320px;
     overflow: auto;
     font-size: 12px;
-    line-height: 1.4;
+    line-height: 1.5;
+    white-space: pre-wrap;
     background: rgba(0, 0, 0, 0.25);
     border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
     border-radius: 6px;
