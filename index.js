@@ -4,42 +4,67 @@ import {
     event_types,
     setExtensionPrompt,
     extension_prompt_types,
-    getRequestHeaders
+    getRequestHeaders,
+    saveSettingsDebounced
 } from '../../../../script.js';
 import { GraphStorage } from './db_store.js';
 import { EmbeddingService } from './embedding_service.js';
 import { LongTermEpistemicGraph } from './long_term_graph_rag.js';
 
+const MODULE = '[EpistemicGraphRAG]';
 const EXTENSION_NAME = 'st-epistemic-graph-rag';
 const PROMPT_TAG = 'epistemic_graph_rag';
 
+console.log(MODULE, 'index.js 开始加载');
+
 const defaultSettings = {
     enabled: true,
+    speakerMode: 'follow',      // follow | manual
     activeSpeaker: '',
     recentWindowSize: 16,
     topK: 8,
     maskAbsentHistory: true,
-    enableVectorApi: true
+    autoSeed: true,
+    debugLog: true
 };
 
 const storage = new GraphStorage();
 const embedder = new EmbeddingService({ getRequestHeaders });
 export const graph = new LongTermEpistemicGraph(embedder);
 
+function log(...args) {
+    if (getSettings().debugLog) console.log(MODULE, ...args);
+}
+
+function toast(msg, level = 'info') {
+    try {
+        if (typeof toastr !== 'undefined' && toastr[level]) toastr[level](msg, 'Epistemic GraphRAG');
+    } catch { /* ignore */ }
+}
+
 function getSettings() {
     if (!extension_settings[EXTENSION_NAME]) {
         extension_settings[EXTENSION_NAME] = { ...defaultSettings };
     }
+    for (const k of Object.keys(defaultSettings)) {
+        if (extension_settings[EXTENSION_NAME][k] === undefined) {
+            extension_settings[EXTENSION_NAME][k] = defaultSettings[k];
+        }
+    }
     return extension_settings[EXTENSION_NAME];
 }
 
-/**
- * 预置第一版 MVP 验证场景：3 个 NPC（小王、小李、小张）、1 个藏钥匙秘密、1 次部分告知
- */
+function persistSettings() {
+    try { saveSettingsDebounced?.(); } catch { /* ignore */ }
+}
+
+/* ------------------------------------------------------------------ */
+/* 测试场景：3 个 NPC、1 个秘密、一次部分告知                            */
+/* ------------------------------------------------------------------ */
 export async function seedMvpWarehouseScenario(targetGraph = graph) {
-    targetGraph.ensureNpc('小王', '小王');
-    targetGraph.ensureNpc('小李', '小李');
-    targetGraph.ensureNpc('小张', '小张');
+    targetGraph.ensureNpc('小王');
+    targetGraph.ensureNpc('小李');
+    targetGraph.ensureNpc('小张');
 
     await targetGraph.ingestEvent({
         event: {
@@ -74,7 +99,7 @@ export async function seedMvpWarehouseScenario(targetGraph = graph) {
         ]
     });
 
-    // 第 4 楼：小李告诉小张“小王去过仓库”，但未透露钥匙的存在
+    // 第 4 楼：小李只告诉小张“小王去过仓库”，没提钥匙
     targetGraph.messagePresence.set(4, new Set(['小李', '小张']));
     targetGraph.propagateFact({
         fromNpcId: '小李',
@@ -86,14 +111,13 @@ export async function seedMvpWarehouseScenario(targetGraph = graph) {
     });
 }
 
-/**
- * 解析回复正文内嵌的 <ta_graph_delta> 或 <graph_op> 增量建图指令
- */
+/* ------------------------------------------------------------------ */
+/* 增量建图标记解析                                                     */
+/* ------------------------------------------------------------------ */
 export async function parseAndApplyGraphMarkup(messageText, messageId, targetGraph = graph) {
     if (!messageText || typeof messageText !== 'string') return false;
     let updated = false;
 
-    // 1. 解析 <ta_graph_delta>{...}</ta_graph_delta> 完整事件+事实+认知边增量块
     const deltaRegex = /<ta_graph_delta>([\s\S]*?)<\/ta_graph_delta>/g;
     let match;
     while ((match = deltaRegex.exec(messageText)) !== null) {
@@ -116,12 +140,12 @@ export async function parseAndApplyGraphMarkup(messageText, messageId, targetGra
                 }))
             });
             updated = true;
+            log('从 <ta_graph_delta> 建图成功', eventId);
         } catch (err) {
-            console.error('[EpistemicGraphRAG] 解析 <ta_graph_delta> 失败:', err);
+            console.error(MODULE, '解析 <ta_graph_delta> 失败:', err);
         }
     }
 
-    // 2. 解析 <graph_op>{"type":"TELL", ...}</graph_op> 角色间口头告知指令
     const opRegex = /<graph_op>([\s\S]*?)<\/graph_op>/g;
     while ((match = opRegex.exec(messageText)) !== null) {
         try {
@@ -137,177 +161,289 @@ export async function parseAndApplyGraphMarkup(messageText, messageId, targetGra
                     isFalseRumor: Boolean(op.isFalseRumor)
                 });
                 updated = true;
+                log('从 <graph_op> 传播事实成功', op.from, '->', op.to);
             }
         } catch (err) {
-            console.error('[EpistemicGraphRAG] 解析 <graph_op> 失败:', err);
+            console.error(MODULE, '解析 <graph_op> 失败:', err);
         }
     }
 
     return updated;
 }
 
-/**
- * SillyTavern 生成前拦截器：
- * 1. 百楼滑动窗口裁剪（移除超出窗口的早期原文）
- * 2. 物理遮蔽当前发言 NPC 不在场的楼层
- * 3. 从该 NPC 的认知子图中混合检索 Top-K 事实并注入 Depth 1
- */
+/* ------------------------------------------------------------------ */
+/* 发言角色解析                                                         */
+/* ------------------------------------------------------------------ */
+function resolveActiveNpc() {
+    const context = getContext();
+    const settings = getSettings();
+    if (settings.speakerMode === 'manual' && settings.activeSpeaker) {
+        return settings.activeSpeaker.trim();
+    }
+    const name2 = context?.name2;
+    if (name2) return name2;
+    const chars = context?.characters;
+    if (Array.isArray(chars) && chars.length > 0) return chars[0].name;
+    return '';
+}
+
+/* ------------------------------------------------------------------ */
+/* 生成拦截器                                                          */
+/* ------------------------------------------------------------------ */
 globalThis.epistemicGraphInterceptor = async function (chat, contextSize, abort, type) {
     const settings = getSettings();
     if (!settings.enabled || !Array.isArray(chat) || chat.length === 0) return;
 
-    const context = getContext();
-    const activeNpc = (settings.activeSpeaker && settings.activeSpeaker.trim()) || context.name2;
-    if (!activeNpc) return;
+    const npc = resolveActiveNpc();
+    if (!npc) {
+        log('拦截器：无法确定当前发言角色，跳过');
+        return;
+    }
 
     const totalMessages = chat.length;
     const recentWindow = Math.max(4, Number(settings.recentWindowSize) || 16);
-    const cutoffIndex = Math.max(0, totalMessages - recentWindow);
+    const cutoff = Math.max(0, totalMessages - recentWindow);
 
-    // 1. 百楼滑动窗口裁剪：超出窗口的历史原文移出本次请求副本，交由 GraphRAG 长期记忆接管
-    if (cutoffIndex > 0) {
-        chat.splice(0, cutoffIndex);
-    }
+    if (cutoff > 0) chat.splice(0, cutoff);
 
-    // 2. 对窗口内楼层执行“不在场物理遮蔽”
     if (settings.maskAbsentHistory) {
         for (let i = 0; i < chat.length - 1; i++) {
-            const msgId = chat[i].mes_id ?? (cutoffIndex + i);
-            const presentSet = graph.messagePresence.get(msgId);
-            if (presentSet && !presentSet.has(activeNpc)) {
-                chat[i] = {
-                    ...chat[i],
-                    mes: `[第${msgId}楼历史隔离：该事件发生时 ${activeNpc} 不在场，无现场记忆]`
-                };
+            const msgId = chat[i]?.mes_id ?? (cutoff + i);
+            const present = graph.messagePresence.get(msgId);
+            if (present && !present.has(npc)) {
+                chat[i] = { ...chat[i], mes: `[第${msgId}楼历史隔离：该事件发生时 ${npc} 不在场，无现场记忆]` };
             }
         }
     }
 
-    // 3. 混合检索该角色认知边界内的长期记忆
-    const queryText = chat.slice(-2).map(m => m.mes || '').join('\n');
+    const queryText = chat.slice(-2).map(m => m?.mes || '').join('\n');
     const { activeFacts, historicalFacts } = await graph.retrieveContextForNpc({
-        npcId: activeNpc,
+        npcId: npc,
         queryText,
         currentMsgId: totalMessages,
         topK: Number(settings.topK) || 8
     });
 
-    // 4. 组装强边界认知提示词并挂载到 Depth 1
-    const epistemicPrompt = graph.buildEpistemicPrompt({
-        npcId: activeNpc,
-        activeFacts,
-        historicalFacts
-    });
+    const prompt = graph.buildEpistemicPrompt({ npcId: npc, activeFacts, historicalFacts });
+    setExtensionPrompt(PROMPT_TAG, prompt, extension_prompt_types.IN_CHAT, 1);
 
-    setExtensionPrompt(
-        PROMPT_TAG,
-        epistemicPrompt,
-        extension_prompt_types.IN_CHAT,
-        1
-    );
+    log(`拦截器注入完成 | 角色=${npc} | 召回=${activeFacts.length} 条 | 总楼层=${totalMessages} | 裁剪=${cutoff}`);
+    if (settings.debugLog) {
+        console.log(MODULE, '注入内容:\n' + prompt);
+    }
 };
 
+/* ------------------------------------------------------------------ */
+/* 与当前聊天同步                                                       */
+/* ------------------------------------------------------------------ */
 async function syncCurrentChatGraph() {
     const context = getContext();
     const chatId = context?.chatId;
-    if (!chatId) return;
+    if (!chatId) {
+        updateStatus('未打开聊天，图谱未挂载');
+        return;
+    }
     const saved = await storage.loadGraph(chatId);
     if (saved) {
         graph.deserialize(saved);
-    } else {
+        log('已从 IndexedDB 载入图谱', chatId, '事实数=', graph.facts.size);
+    } else if (getSettings().autoSeed) {
         await seedMvpWarehouseScenario(graph);
         await storage.saveGraph(chatId, graph.serialize());
+        log('首次进入该聊天，已写入测试图谱');
     }
+    updateStatus();
 }
 
-function mountExtensionSettingsUi() {
-    if (typeof jQuery === 'undefined') return;
-    const settings = getSettings();
-    const html = `
-    <div class="epistemic-graph-settings">
-        <div class="inline-drawer">
-            <div class="inline-drawer-toggle inline-drawer-header">
-                <b>Epistemic GraphRAG (多角色知情边界与百楼记忆)</b>
-                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-            </div>
-            <div class="inline-drawer-content">
-                <label class="checkbox_label">
-                    <input id="eg_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''} />
-                    <span>启用知情边界拦截与 GraphRAG 检索</span>
-                </label>
-                <label class="checkbox_label">
-                    <input id="eg_mask_absent" type="checkbox" ${settings.maskAbsentHistory ? 'checked' : ''} />
-                    <span>物理遮蔽当前角色不在场的历史楼层</span>
-                </label>
-                <div class="eg-row">
-                    <label for="eg_active_speaker">当前受询/发言 NPC（留空默认跟随当前角色卡）：</label>
-                    <input id="eg_active_speaker" class="text_pole" type="text" placeholder="例如：小张 / 小李 / 小王" value="${settings.activeSpeaker || ''}" />
-                </div>
-                <div class="eg-row">
-                    <label for="eg_window_size">短期原文滑动窗口楼层数（其余百楼历史转入图谱检索）：</label>
-                    <input id="eg_window_size" class="text_pole" type="number" min="4" max="64" value="${settings.recentWindowSize}" />
-                </div>
-                <div class="eg-actions">
-                    <button id="eg_seed_mvp" class="menu_button" type="button">重置并载入“三NPC仓库藏钥匙”测试图谱</button>
-                </div>
-                <pre id="eg_inspector" class="eg-inspector"></pre>
-            </div>
-        </div>
-    </div>`;
+async function persistGraph() {
+    const chatId = getContext()?.chatId;
+    if (!chatId) return;
+    await storage.saveGraph(chatId, graph.serialize());
+}
 
-    jQuery('#extensions_settings2').append(html);
+/* ------------------------------------------------------------------ */
+/* 面板                                                                */
+/* ------------------------------------------------------------------ */
+const PANEL_HTML = `
+<div id="eg_panel_root" class="epistemic-graph-settings">
+  <div class="inline-drawer">
+    <div class="inline-drawer-toggle inline-drawer-header">
+      <b>Epistemic GraphRAG · 知情边界与长期记忆</b>
+      <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    </div>
+    <div class="inline-drawer-content">
+      <div class="eg-status" id="eg_status">加载中…</div>
 
-    const refreshInspector = () => {
-        const stats = {
-            npcs: Array.from(graph.npcs.keys()),
-            totalEvents: graph.events.size,
-            totalFacts: graph.facts.size,
-            edgesByNpc: Object.fromEntries(
-                Array.from(graph.knowledgeEdges.entries()).map(([k, m]) => [k, Array.from(m.keys())])
-            )
-        };
-        jQuery('#eg_inspector').text(JSON.stringify(stats, null, 2));
-    };
+      <label class="checkbox_label">
+        <input id="eg_enabled" type="checkbox" ${getSettings().enabled ? 'checked' : ''} />
+        <span>启用知情边界拦截与图谱检索</span>
+      </label>
+      <label class="checkbox_label">
+        <input id="eg_mask" type="checkbox" ${getSettings().maskAbsentHistory ? 'checked' : ''} />
+        <span>遮蔽当前角色不在场的历史楼层</span>
+      </label>
+      <label class="checkbox_label">
+        <input id="eg_debug" type="checkbox" ${getSettings().debugLog ? 'checked' : ''} />
+        <span>控制台输出注入内容（调试）</span>
+      </label>
 
-    jQuery('#eg_enabled').on('change', function () {
-        getSettings().enabled = Boolean(jQuery(this).prop('checked'));
+      <div class="eg-row">
+        <label>当前发言角色</label>
+        <select id="eg_speaker_mode" class="text_pole">
+          <option value="follow">跟随当前角色卡（name2）</option>
+          <option value="manual">手动指定</option>
+        </select>
+        <input id="eg_speaker" class="text_pole" type="text" placeholder="手动指定角色名" />
+      </div>
+
+      <div class="eg-row">
+        <label>短期原文窗口（楼）</label>
+        <input id="eg_window" class="text_pole" type="number" min="4" max="64" />
+      </div>
+      <div class="eg-row">
+        <label>召回条数 Top-K</label>
+        <input id="eg_topk" class="text_pole" type="number" min="1" max="24" />
+      </div>
+
+      <div class="eg-actions">
+        <button id="eg_seed" class="menu_button" type="button">载入测试图谱</button>
+        <button id="eg_preview" class="menu_button" type="button">预览本次注入</button>
+        <button id="eg_stats" class="menu_button" type="button">刷新状态</button>
+      </div>
+
+      <pre id="eg_output" class="eg-inspector">点“预览本次注入”查看当前角色到底能看见什么。</pre>
+    </div>
+  </div>
+</div>`;
+
+function bindPanel() {
+    const $ = jQuery;
+    const s = getSettings();
+
+    $('#eg_enabled').prop('checked', s.enabled).on('change', function () {
+        s.enabled = Boolean($(this).prop('checked')); persistSettings();
     });
-    jQuery('#eg_mask_absent').on('change', function () {
-        getSettings().maskAbsentHistory = Boolean(jQuery(this).prop('checked'));
+    $('#eg_mask').prop('checked', s.maskAbsentHistory).on('change', function () {
+        s.maskAbsentHistory = Boolean($(this).prop('checked')); persistSettings();
     });
-    jQuery('#eg_active_speaker').on('input', function () {
-        getSettings().activeSpeaker = String(jQuery(this).val() || '').trim();
+    $('#eg_debug').prop('checked', s.debugLog).on('change', function () {
+        s.debugLog = Boolean($(this).prop('checked')); persistSettings();
     });
-    jQuery('#eg_window_size').on('change', function () {
-        getSettings().recentWindowSize = Number(jQuery(this).val()) || 16;
+    $('#eg_speaker_mode').val(s.speakerMode).on('change', function () {
+        s.speakerMode = String($(this).val()); persistSettings();
     });
-    jQuery('#eg_seed_mvp').on('click', async function () {
+    $('#eg_speaker').val(s.activeSpeaker).on('input', function () {
+        s.activeSpeaker = String($(this).val()); persistSettings();
+    });
+    $('#eg_window').val(s.recentWindowSize).on('change', function () {
+        s.recentWindowSize = Number($(this).val()) || 16; persistSettings();
+    });
+    $('#eg_topk').val(s.topK).on('change', function () {
+        s.topK = Number($(this).val()) || 8; persistSettings();
+    });
+
+    $('#eg_seed').on('click', async () => {
         await seedMvpWarehouseScenario(graph);
-        const chatId = getContext()?.chatId;
-        if (chatId) await storage.saveGraph(chatId, graph.serialize());
-        refreshInspector();
+        await persistGraph();
+        updateStatus();
+        toast('已载入测试图谱：小王 / 小李 / 小张');
+        $('#eg_output').text('测试图谱已就绪。切到“预览本次注入”，把发言角色分别设为 小王 / 小李 / 小张 对比结果。');
     });
 
-    refreshInspector();
+    $('#eg_stats').on('click', () => updateStatus());
+
+    $('#eg_preview').on('click', async () => {
+        const npc = resolveActiveNpc();
+        if (!npc) { $('#eg_output').text('无法确定当前发言角色：请打开一个角色聊天，或改为手动指定。'); return; }
+        const ctx = getContext();
+        const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+        const query = (chat[chat.length - 1]?.mes || '') + '\n' + (chat[chat.length - 2]?.mes || '');
+        const res = await graph.retrieveContextForNpc({
+            npcId: npc,
+            queryText: query,
+            currentMsgId: chat.length,
+            topK: Number(getSettings().topK) || 8
+        });
+        const prompt = graph.buildEpistemicPrompt({
+            npcId: npc,
+            activeFacts: res.activeFacts,
+            historicalFacts: res.historicalFacts
+        });
+        $('#eg_output').text(
+            `【角色】${npc}\n【召回】${res.activeFacts.length} 条有效 / ${res.historicalFacts.length} 条旧状态\n` +
+            `──────────────\n${prompt}`
+        );
+        log('预览', npc, res);
+    });
+
+    updateStatus();
 }
 
-if (typeof jQuery !== 'undefined') {
-    jQuery(async () => {
+function updateStatus(extra) {
+    const $ = jQuery;
+    if (!$ || !$('#eg_status')?.length) return;
+    const ctx = getContext();
+    const npc = resolveActiveNpc();
+    const lines = [
+        `聊天ID：${ctx?.chatId || '（未打开）'}`,
+        `发言角色：${npc || '（未识别）'}`,
+        `NPC 节点：${graph.npcs.size}　事件：${graph.events.size}　事实：${graph.facts.size}`,
+        `认知边：${Array.from(graph.knowledgeEdges.values()).reduce((a, m) => a + m.size, 0)}`
+    ];
+    if (extra) lines.push(extra);
+    $('#eg_status').text(lines.join('　|　'));
+}
+
+function mountPanel() {
+    if (typeof jQuery === 'undefined') return false;
+    if (document.getElementById('eg_panel_root')) return true;
+    const target =
+        document.querySelector('#extensions_settings2') ||
+        document.querySelector('#extensions_settings');
+    if (!target) return false;
+    target.insertAdjacentHTML('beforeend', PANEL_HTML);
+    bindPanel();
+    console.log(MODULE, '设置面板已挂载到', target.id);
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* 启动                                                                */
+/* ------------------------------------------------------------------ */
+let mounted = false;
+function tryMount(times = 0) {
+    if (mountPanel()) {
+        mounted = true;
+        return;
+    }
+    if (times > 120) {
+        console.error(MODULE, '设置面板挂载失败：未找到 #extensions_settings2 / #extensions_settings');
+        return;
+    }
+    setTimeout(() => tryMount(times + 1), 500);
+}
+
+jQuery(async () => {
+    try {
+        console.log(MODULE, 'jQuery ready，开始初始化');
         await syncCurrentChatGraph();
-        mountExtensionSettingsUi();
+        tryMount();
 
         eventSource.on(event_types.CHAT_CHANGED, async () => {
             await syncCurrentChatGraph();
         });
 
         eventSource.on(event_types.MESSAGE_RECEIVED, async (messageIndex) => {
-            const context = getContext();
-            const msg = context?.chat?.[messageIndex];
-            if (!msg || !msg.mes) return;
+            const ctx = getContext();
+            const msg = ctx?.chat?.[messageIndex];
+            if (!msg?.mes) return;
             const changed = await parseAndApplyGraphMarkup(msg.mes, messageIndex, graph);
-            if (changed && context?.chatId) {
-                await storage.saveGraph(context.chatId, graph.serialize());
-            }
+            if (changed) await persistGraph();
+            if (mounted) updateStatus();
         });
-    });
-}
+
+        console.log(MODULE, '初始化完成');
+    } catch (err) {
+        console.error(MODULE, '初始化异常:', err);
+    }
+});
