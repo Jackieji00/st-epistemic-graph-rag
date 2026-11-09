@@ -61,6 +61,62 @@ git clone git@github.com:Jackieji00/st-epistemic-graph-rag.git
 
 生成时开启「控制台输出注入内容」，可直接看到本轮实际注入的提示词全文。
 
+## 用你自己的世界（自定义）
+
+测试图谱只是示例，真实使用有三条路径，可混用：
+
+### A. 手动导入 JSON（最可控）
+
+面板 → 自定义图谱导入 → 粘贴 JSON → 点「导入 JSON」。模板见 [`examples/custom-graph.example.json`](examples/custom-graph.example.json)。
+
+```json
+{
+  "npcs": ["角色A", "角色B", "角色C"],
+  "events": [{
+    "id": "evt_1",
+    "messageId": 12,
+    "timestamp": "第12楼 深夜",
+    "location": "地窖",
+    "participants": ["角色A", "角色B"],
+    "facts": [
+      { "id": "f1", "content": "角色A深夜去过地窖。", "entities": ["角色A", "地窖"], "keywords": ["地窖"] },
+      { "id": "f2", "content": "角色A把信物埋在东墙第三块砖后。", "entities": ["角色A", "信物", "砖墙"], "keywords": ["信物", "埋"], "isSecret": true }
+    ],
+    "grants": [
+      { "npcId": "角色A", "factId": "f1", "sourceType": "ACTOR" },
+      { "npcId": "角色A", "factId": "f2", "sourceType": "ACTOR" },
+      { "npcId": "角色B", "factId": "f2", "sourceType": "WITNESS" },
+      { "npcId": "角色C", "factId": "f1", "sourceType": "HEARSAY", "sourceNpc": "角色B",
+        "distortedContent": "听角色B说，角色A昨晚一个人去了地窖。" }
+    ]
+  }]
+}
+```
+
+字段要点：
+
+| 字段 | 说明 |
+| :--- | :--- |
+| `messageId` | 该事件发生在聊天第几楼（数组序号，从 0 开始）；决定「不在场遮蔽」是否命中。不确定可先用估算值，遮蔽只会更保守 |
+| `facts[].content` | 客观事实，一句话、具体、可检索 |
+| `facts[].entities` | 参与实体；同名实体会自动做 1-Hop 关联扩散 |
+| `facts[].isSecret` | 仅标记用途，真正控制可见性的是 `grants` |
+| `facts[].supersedesFactId` | 本条取代哪条旧事实（物品转移、人物死亡等状态变更） |
+| `grants[].sourceType` | `ACTOR` 亲历 / `WITNESS` 目击 / `HEARSAY` 听传 / `INFERRED` 推理 / `RUMOR_FALSE` 谣言 |
+| `grants[].distortedContent` | 该角色实际听到的（可能是残缺或错误）版本；填了就用它替代原文 |
+
+⚠️ 只有出现在 `grants` 里的角色 + 事实组合才可见。漏写 = 该角色完全不知道。
+
+### B. 让主模型自动建图（长篇必需）
+
+面板点「复制建图规则」，把内容粘到你预设的系统提示词或世界书条目里。之后模型每轮会在正文后附一个 `<ta_graph_delta>` 块（用酒馆正则设为隐藏/不显示），插件自动解析、落图、持久化 —— 不额外发请求。
+
+告诉模型何时给人「部分告知」、何时用 `supersedesFactId`，是这套规则最关键的两个约束，规则文本里已写明。
+
+### C. 导出 → 手改 → 再导入
+
+先手动导入几条，点「导出到导入框」拿到当前图谱 JSON，按需增删后重新导入（合并语义，不会覆盖已有节点）。
+
 ## 目录
 
 | 文件 | 说明 |

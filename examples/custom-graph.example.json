@@ -1,0 +1,65 @@
+{
+  "npcs": ["角色A", "角色B", "角色C"],
+  "events": [
+    {
+      "id": "evt_custom_001",
+      "messageId": 12,
+      "timestamp": "第12楼 深夜",
+      "location": "地窖",
+      "participants": ["角色A", "角色B"],
+      "summary": "角色A在地窖藏了信物，角色B全程目击。",
+      "facts": [
+        {
+          "id": "fact_custom_001_a",
+          "content": "角色A在深夜去过地窖。",
+          "entities": ["角色A", "地窖"],
+          "keywords": ["角色A", "地窖", "深夜"],
+          "isSecret": false
+        },
+        {
+          "id": "fact_custom_001_b",
+          "content": "角色A把一枚刻着家纹的信物埋在地窖东墙第三块砖后面。",
+          "entities": ["角色A", "信物", "地窖", "砖墙"],
+          "keywords": ["信物", "家纹", "地窖", "砖墙", "埋"],
+          "isSecret": true
+        }
+      ],
+      "grants": [
+        { "npcId": "角色A", "factId": "fact_custom_001_a", "sourceType": "ACTOR", "learnedAtMsg": 12, "confidence": 1.0 },
+        { "npcId": "角色A", "factId": "fact_custom_001_b", "sourceType": "ACTOR", "learnedAtMsg": 12, "confidence": 1.0 },
+        { "npcId": "角色B", "factId": "fact_custom_001_a", "sourceType": "WITNESS", "learnedAtMsg": 12, "confidence": 0.95 },
+        { "npcId": "角色B", "factId": "fact_custom_001_b", "sourceType": "WITNESS", "learnedAtMsg": 12, "confidence": 0.95 },
+        {
+          "npcId": "角色C",
+          "factId": "fact_custom_001_a",
+          "sourceType": "HEARSAY",
+          "sourceNpc": "角色B",
+          "learnedAtMsg": 15,
+          "confidence": 0.7,
+          "distortedContent": "听角色B说，角色A昨晚一个人去了地窖。"
+        }
+      ]
+    },
+    {
+      "id": "evt_custom_002",
+      "messageId": 40,
+      "timestamp": "第40楼 清晨",
+      "location": "地窖",
+      "participants": ["角色A"],
+      "summary": "角色A独自把信物转移到别处，角色B、角色C均不知情。",
+      "facts": [
+        {
+          "id": "fact_custom_002_a",
+          "content": "角色A在清晨把信物从地窖砖墙里取出，改藏在随身内袋。",
+          "entities": ["角色A", "信物", "内袋"],
+          "keywords": ["信物", "转移", "内袋"],
+          "isSecret": true,
+          "supersedesFactId": "fact_custom_001_b"
+        }
+      ],
+      "grants": [
+        { "npcId": "角色A", "factId": "fact_custom_002_a", "sourceType": "ACTOR", "learnedAtMsg": 40, "confidence": 1.0 }
+      ]
+    }
+  ]
+}
