@@ -47,11 +47,14 @@ export async function importGraphJson(text, targetGraph) {
 
     for (const n of npcs) {
         const name = typeof n === 'string' ? n : (n?.name || n?.id);
-        if (name) targetGraph.ensureNpc(name, name);
+        if (name) {
+            targetGraph.ensureNpc(name, name);
+            if (n?.abilities !== undefined) targetGraph.setAbilities(name, n.abilities);
+        }
     }
 
     let factCount = 0;
-    let edgeCount = 0;
+    const grantsToApply = [];
     const warnings = [];
 
     for (const ev of events) {
@@ -88,19 +91,20 @@ export async function importGraphJson(text, targetGraph) {
                 participants,
                 summary: ev.summary || ''
             },
-            facts,
-            epistemicGrants: validGrants
+            facts
         });
 
         factCount += facts.length;
-        edgeCount += validGrants.length;
+        grantsToApply.push(...validGrants.map(g => ({ learnedAtMsg: Number(ev.messageId ?? 0), ...g })));
     }
 
+    const refused = targetGraph.applyGrants(grantsToApply);
+    for (const g of refused) warnings.push(`${g.npcId} → ${g.factId}：获知依据或能力条件不足，已跳过`);
     return {
         npcs: npcs.length,
         events: events.length,
         facts: factCount,
-        edges: edgeCount,
+        edges: grantsToApply.length - refused.length,
         warnings
     };
 }
@@ -114,7 +118,7 @@ export function exportGraphJson(targetGraph) {
     }
 
     return JSON.stringify({
-        npcs: data.npcs.map(([id, v]) => v?.name || id),
+        npcs: data.npcs.map(([id, v]) => v?.abilities?.length ? { name: id, abilities: v.abilities } : id),
         events: data.events.map(([, ev]) => ({
             id: ev.id,
             messageId: ev.messageId,
@@ -127,7 +131,10 @@ export function exportGraphJson(targetGraph) {
                 content: f.content,
                 entities: f.entities,
                 keywords: f.keywords,
-                isSecret: f.isSecret
+                isSecret: f.isSecret,
+                ...(f.subtle && { subtle: true }),
+                ...(f.inferenceTarget && { inferenceTarget: true }),
+                ...(f.requiresAbilities?.length && { requiresAbilities: f.requiresAbilities })
             })),
             grants: data.knowledgeEdges.flatMap(([npcId, edges]) =>
                 edges
@@ -139,7 +146,9 @@ export function exportGraphJson(targetGraph) {
                         sourceNpc: e.sourceNpc,
                         learnedAtMsg: e.learnedAtMsg,
                         confidence: e.confidence,
-                        distortedContent: e.distortedContent
+                        distortedContent: e.distortedContent,
+                        ...(e.noticedCue && { noticedCue: e.noticedCue }),
+                        ...(e.basisFactIds && { basisFactIds: e.basisFactIds })
                     }))
             )
         }))

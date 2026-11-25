@@ -36,7 +36,7 @@ Returns the configured manual speaker when manual mode is enabled; otherwise use
 
 ## Supporting modules
 
-- `long_term_graph_rag.js`: `ensureNpc` creates stable NPC nodes; `ingestEvent` records event, facts, presence, and grants; `grantKnowledge` creates per-NPC edges; `propagateFact` models explicit information transfer; `retrieveContextForNpc` applies knowledge-edge filtering and hybrid ranking; `sanitizeChatHistoryForNpc` is the standalone history-masking helper; `buildEpistemicPrompt` formats retrieved facts; `_sparseSimilarity` scores lexical overlap; `serialize` and `deserialize` convert graph state to/from persistence-safe data.
+- `long_term_graph_rag.js` stores events, facts and individual knowledge grants. Retrieval ranks the speaker’s known versions using visible clues, their frequency in this speaker’s memories, recency, and optional embeddings for fully known facts. It follows links through clues visible on both sides. The same module projects chat history, formats the memory prompt and serializes the graph.
 - `db_store.js`: `init` opens the IndexedDB store; `saveGraph`, `loadGraph`, and `deleteGraph` operate on a chat-ID key. All return promises and keep chats isolated.
 - `embedding_service.js`: `embedText` requests a vector when configured and available; `cosineSimilarity` compares numeric vectors and supports retrieval ranking.
 - `graph_io.js`: `importGraphJson` validates and merges user-provided graph data, returning counts and warnings; `exportGraphJson` serializes a graph to editable JSON.
